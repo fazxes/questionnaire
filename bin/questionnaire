@@ -1,0 +1,121 @@
+#!/usr/bin/env node
+// questionnaire: ask the agent about its task one question at a time, then write the skills
+// to load and the rules to follow for the session.
+//
+//   questionnaire start  <run-folder>                              start, and print the first question
+//   questionnaire next   <run-folder>                              print the next question, or the result
+//   questionnaire answer <run-folder> <question> <choice>[,<choice>] answer a choice question
+//   questionnaire answer <run-folder> <question> --text "..."      answer a text question
+//   questionnaire status <run-folder>                              print every answer so far
+//
+// Answer a question again to change it; the questions that no longer apply are dropped.
+// Exit codes: 0 ok, 1 the gate refused an answer (the reason is printed), 2 a usage problem.
+"use strict";
+
+const fs = require("fs");
+const path = require("path");
+const tree = require("../questions.js");
+const engine = require("../lib/engine.js");
+
+const SELF = `node ${path.resolve(__filename)}`;
+const [, , command, runArg, ...rest] = process.argv;
+
+function usage(message) {
+  if (message) console.error(message);
+  const help = fs.readFileSync(__filename, "utf8").split("\n").slice(4, 9).map((line) => line.replace(/^\/\/ ?/, ""));
+  console.error(help.join("\n"));
+  process.exit(2);
+}
+
+function files(run) {
+  if (!run) usage("Give a run folder, such as .questionnaire/my-task.");
+  const dir = path.resolve(run);
+  return { dir, answers: path.join(dir, "answers.json"), skills: path.join(dir, "skills.md"), rules: path.join(dir, "rules.md") };
+}
+
+// Write a file whole: a reader sees the old content or the new, never half of it.
+function writeWhole(file, text) {
+  const tmp = `${file}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, text);
+  fs.renameSync(tmp, file);
+}
+
+function load(f) {
+  if (!fs.existsSync(f.answers)) usage(`No questionnaire in ${f.dir}. Start one: ${SELF} start ${f.dir}`);
+  return JSON.parse(fs.readFileSync(f.answers, "utf8")).answers;
+}
+
+// Save the answers. The skills and rules files exist only while every question is answered.
+function save(f, answers) {
+  writeWhole(f.answers, JSON.stringify({ answers }, null, 2) + "\n");
+  const done = engine.current(tree, answers) === null && !engine.stopOf(tree, answers);
+  if (done) {
+    writeWhole(f.skills, engine.renderSkills(tree, answers));
+    writeWhole(f.rules, engine.renderRules(tree, answers));
+  } else {
+    for (const file of [f.skills, f.rules]) if (fs.existsSync(file)) fs.unlinkSync(file);
+  }
+}
+
+function showNext(f, answers) {
+  const stop = engine.stopOf(tree, answers);
+  if (stop) {
+    console.log(`Stop: ${stop.text}`);
+    return;
+  }
+  const next = engine.current(tree, answers);
+  if (next) {
+    console.log(engine.renderQuestion(tree, next, `${SELF} answer ${f.dir}`));
+    return;
+  }
+  console.log(`Done. Load every skill in ${f.skills}, and follow ${f.rules} for the whole session.`);
+}
+
+function start() {
+  const f = files(runArg);
+  if (fs.existsSync(f.answers)) usage(`${f.dir} already has a questionnaire. See where it is: ${SELF} next ${f.dir}`);
+  fs.mkdirSync(f.dir, { recursive: true });
+  save(f, {});
+  showNext(f, {});
+}
+
+function next() {
+  const f = files(runArg);
+  showNext(f, load(f));
+}
+
+function answer() {
+  const f = files(runArg);
+  const answers = load(f);
+  const [qid, ...words] = rest;
+  if (!qid) usage("Name the question you answer.");
+  const textAt = words.indexOf("--text");
+  const given = textAt >= 0 ? { text: words.slice(textAt + 1).join(" ") } : { picks: (words[0] || "").split(",").map((p) => p.trim()).filter(Boolean) };
+  const question = tree.QUESTIONS[qid];
+  if (question && question.text && !("text" in given)) given.text = "";
+  const problems = engine.check(tree, answers, qid, question && question.text ? { text: given.text } : given);
+  if (problems.length) {
+    for (const problem of problems) console.error(`refused: ${problem}`);
+    process.exit(1);
+  }
+  const saved = engine.apply(tree, answers, qid, question.text ? { text: given.text.trim() } : { picks: given.picks });
+  save(f, saved);
+  showNext(f, saved);
+}
+
+function status() {
+  const f = files(runArg);
+  const answers = load(f);
+  const next = engine.current(tree, answers);
+  for (const qid of engine.queue(tree, answers)) {
+    const a = answers[qid];
+    const shown = a ? (a.picks ? a.picks.join(", ") : JSON.stringify(a.text)) : qid === next ? "(next)" : "(later)";
+    console.log(`${qid.padEnd(14)} ${shown}`);
+  }
+  const done = next === null && !engine.stopOf(tree, answers);
+  console.log(done ? `\nDone: ${f.skills} and ${f.rules}` : "");
+}
+
+const commands = { start, next, answer, status };
+if (!commands[command]) usage(command ? `Unknown command "${command}".` : "");
+commands[command]();
